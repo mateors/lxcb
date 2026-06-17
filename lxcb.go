@@ -1,7 +1,14 @@
+// Package lxcb implements a database/sql driver for Couchbase N1QL.
+// It registers under the driver name "n1ql".
+//
+// Usage:
+//
+//	db, err := sql.Open("n1ql", "http://localhost:8093")
 package lxcb
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"database/sql/driver"
 	"encoding/json"
@@ -10,584 +17,586 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
-	"strings"
 	"sync"
 )
 
-var params map[string]string
-var N1QL_PASSTHROUGH_MODE = false
+// -----------------------------------------------------------------------
+// Package-level defaults
+// -----------------------------------------------------------------------
 
-// HTTPClient to use for REST and view operations.
-var MaxIdleConnsPerHost = 10
-var HTTPTransport = &http.Transport{MaxIdleConnsPerHost: MaxIdleConnsPerHost}
-var HTTPClient = &http.Client{Transport: HTTPTransport}
+var (
+	// DefaultMaxIdleConnsPerHost controls the connection pool size for the
+	// default HTTP transport. Must be set before calling sql.Open.
+	DefaultMaxIdleConnsPerHost = 10
 
-func SetQueryParams(key string, value string) error {
-
-	if key == "" {
-		return fmt.Errorf("N1QL: Key not specified")
+	// DefaultHTTPClient is used when no custom client is provided via Config.
+	DefaultHTTPClient = &http.Client{
+		Transport: &http.Transport{
+			MaxIdleConnsPerHost: DefaultMaxIdleConnsPerHost,
+		},
 	}
-	params[key] = value
-	return nil
-}
 
-// implements Driver interface
-type n1qlDriver struct{}
+	// placeholderRe matches bare ? placeholders in a query.
+	placeholderRe = regexp.MustCompile(`\?`)
+)
 
 func init() {
 	sql.Register("n1ql", &n1qlDriver{})
-	params = make(map[string]string)
-	//fmt.Println("params...")
 }
 
-//username:password@protocol(address)/dbname?param=value
-func (n *n1qlDriver) Open(dataSourceName string) (driver.Conn, error) {
-	//fmt.Println("open...", dataSourceName)
-	return openConn2(dataSourceName)
+// -----------------------------------------------------------------------
+// Driver
+// -----------------------------------------------------------------------
+
+// n1qlDriver implements driver.Driver.
+type n1qlDriver struct{}
+
+// Open opens a new connection to the N1QL query service.
+// dataSourceName must be the base URL of the Couchbase node,
+// e.g. "http://localhost:8093".
+func (d *n1qlDriver) Open(dataSourceName string) (driver.Conn, error) {
+	return openConn(context.Background(), dataSourceName, nil)
 }
 
-func setQueryParams(v *url.Values) {
+// -----------------------------------------------------------------------
+// Config — per-connection settings (no globals)
+// -----------------------------------------------------------------------
 
-	//fmt.Println("paramsLen:", params, len(params))
-	for key, value := range params {
-		v.Set(key, value)
-		//fmt.Println(key, "==>", value)
+// Config holds per-connection query parameters and optional HTTP client
+// override. Pass nil to use package defaults.
+type Config struct {
+	// QueryParams are appended to every N1QL request (e.g. "scan_consistency").
+	QueryParams map[string]string
+
+	// HTTPClient overrides DefaultHTTPClient when set.
+	HTTPClient *http.Client
+
+	// PassthroughMode causes metrics/status/requestID to be returned as
+	// extra rows, matching the raw N1QL response envelope.
+	PassthroughMode bool
+}
+
+// -----------------------------------------------------------------------
+// Connection
+// -----------------------------------------------------------------------
+
+// n1qlConn implements driver.Conn, driver.QueryerContext, driver.ExecerContext.
+type n1qlConn struct {
+	queryAPI string
+	client   *http.Client
+	config   Config
+	mu       sync.RWMutex // protects queryAPI only; config is read-only after construction
+}
+
+func openConn(ctx context.Context, dataSourceName string, cfg *Config) (*n1qlConn, error) {
+	c := &n1qlConn{
+		queryAPI: fmt.Sprintf("%s/query/service", dataSourceName),
+		client:   DefaultHTTPClient,
 	}
-}
 
-// prepare a http request for the query
-func prepareRequest(query string, queryAPI string, args []driver.Value) (*http.Request, error) {
-
-	postData := url.Values{}
-	postData.Set("statement", query)
-
-	if len(args) > 0 {
-		paStr := buildPositionalArgList(args)
-		if len(paStr) > 0 {
-			postData.Set("args", paStr)
+	if cfg != nil {
+		c.config = *cfg
+		if cfg.HTTPClient != nil {
+			c.client = cfg.HTTPClient
 		}
 	}
 
-	setQueryParams(&postData)
-	//fmt.Println("prepareRequest...", postData)
-	request, _ := http.NewRequest("POST", queryAPI, bytes.NewBufferString(postData.Encode()))
-	request.Header.Add("Content-Type", "application/x-www-form-urlencoded")
-	return request, nil
-}
-
-func openConn2(dataSourceName string) (driver.Conn, error) {
-
-	queryAPI := fmt.Sprintf("%s/query/service", dataSourceName)
-	conn := &n1qlConn{client: HTTPClient, queryAPI: queryAPI}
-
-	request, err := prepareRequest("SELECT 1", queryAPI, nil)
+	// Validate connectivity.
+	req, err := c.buildRequest(ctx, "SELECT 1", nil)
 	if err != nil {
 		return nil, err
 	}
 
-	resp, err := conn.client.Do(request)
-	//fmt.Println(params, dataSourceName, queryAPI, resp.Status)
+	resp, err := c.client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("n1ql: connection failed: %w", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		bod, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, fmt.Errorf("N1QL: Connection failure %s", bod)
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, fmt.Errorf("n1ql: connection check returned HTTP %d: %s", resp.StatusCode, body)
 	}
-	return conn, err
+
+	return c, nil
 }
 
-// implements driver.Conn interface
-type n1qlConn struct {
-	//clusterAddress string
-	queryAPI string
-	client   *http.Client
-	lock     sync.RWMutex
+// Close is a no-op; the HTTP client manages its own connection pool.
+func (c *n1qlConn) Close() error { return nil }
+
+// Begin is not supported — Couchbase N1QL does not expose SQL transactions
+// via this interface.
+func (c *n1qlConn) Begin() (driver.Tx, error) {
+	return nil, fmt.Errorf("n1ql: transactions are not supported")
 }
 
-func (conn *n1qlConn) doClientRequest(query string, requestValues *url.Values) (*http.Response, error) {
+// -----------------------------------------------------------------------
+// Prepare
+// -----------------------------------------------------------------------
 
-	ok := false
-	for !ok {
+// Prepare sends a PREPARE statement to Couchbase and returns a driver.Stmt.
+func (c *n1qlConn) Prepare(query string) (driver.Stmt, error) {
+	return c.PrepareContext(context.Background(), query)
+}
 
-		var request *http.Request
-		var err error
+// PrepareContext is the context-aware variant of Prepare.
+func (c *n1qlConn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
+	prepared, argCount := replacePlaceholders(query)
+	prepareSQL := "PREPARE " + prepared
 
-		// select query API
-		//rand.Seed(time.Now().Unix())
-		numNodes := 1 //len(conn.queryAPIs)
+	req, err := c.buildRequest(ctx, prepareSQL, nil)
+	if err != nil {
+		return nil, err
+	}
 
-		//selectedNode := rand.Intn(numNodes)
-		conn.lock.RLock()
-		queryAPI := conn.queryAPI //conn.queryAPIs[selectedNode]
-		conn.lock.RUnlock()
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("n1ql: prepare request failed: %w", err)
+	}
+	defer resp.Body.Close()
 
-		if query != "" {
-			request, err = prepareRequest(query, queryAPI, nil)
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, fmt.Errorf("n1ql: prepare returned HTTP %d: %s", resp.StatusCode, body)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("n1ql: reading prepare response: %w", err)
+	}
+
+	var envelope struct {
+		Errors  []n1qlError       `json:"errors"`
+		Results []json.RawMessage `json:"results"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return nil, fmt.Errorf("n1ql: parsing prepare response: %w", err)
+	}
+
+	if len(envelope.Errors) > 0 {
+		return nil, fmt.Errorf("n1ql: prepare error: %s", serializeErrors(envelope.Errors))
+	}
+
+	if len(envelope.Results) == 0 {
+		return nil, fmt.Errorf("n1ql: prepare returned no results")
+	}
+
+	var meta struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(envelope.Results[0], &meta); err != nil {
+		return nil, fmt.Errorf("n1ql: parsing prepared statement metadata: %w", err)
+	}
+
+	return &n1qlStmt{
+		conn:     c,
+		prepared: string(envelope.Results[0]),
+		name:     meta.Name,
+		argCount: argCount,
+	}, nil
+}
+
+// -----------------------------------------------------------------------
+// Query / Exec (direct, non-prepared)
+// -----------------------------------------------------------------------
+
+// QueryContext implements driver.QueryerContext.
+func (c *n1qlConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	vals, err := namedValuesToValues(args)
+	if err != nil {
+		return nil, err
+	}
+	return c.execQuery(ctx, query, vals)
+}
+
+// ExecContext implements driver.ExecerContext.
+func (c *n1qlConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	vals, err := namedValuesToValues(args)
+	if err != nil {
+		return nil, err
+	}
+	return c.execMutation(ctx, query, vals)
+}
+
+// Legacy driver.Queryer / driver.Execer (no context).
+func (c *n1qlConn) Query(query string, args []driver.Value) (driver.Rows, error) {
+	return c.execQuery(context.Background(), query, args)
+}
+
+func (c *n1qlConn) Exec(query string, args []driver.Value) (driver.Result, error) {
+	return c.execMutation(context.Background(), query, args)
+}
+
+// -----------------------------------------------------------------------
+// Internal query execution
+// -----------------------------------------------------------------------
+
+func (c *n1qlConn) execQuery(ctx context.Context, query string, args []driver.Value) (driver.Rows, error) {
+	req, err := c.buildRequestWithArgs(ctx, query, args, nil)
+	if err != nil {
+		return nil, err
+	}
+	return c.doQuery(req)
+}
+
+func (c *n1qlConn) execMutation(ctx context.Context, query string, args []driver.Value) (driver.Result, error) {
+	req, err := c.buildRequestWithArgs(ctx, query, args, nil)
+	if err != nil {
+		return nil, err
+	}
+	return c.doExec(req)
+}
+
+// doQuery fires the HTTP request and returns a streaming Rows.
+func (c *n1qlConn) doQuery(req *http.Request) (driver.Rows, error) {
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("n1ql: query request failed: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, fmt.Errorf("n1ql: query returned HTTP %d: %s", resp.StatusCode, body)
+	}
+
+	return newStreamingRows(resp, c.config.PassthroughMode)
+}
+
+// doExec fires the HTTP request and parses mutation metrics.
+func (c *n1qlConn) doExec(req *http.Request) (driver.Result, error) {
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("n1ql: exec request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, fmt.Errorf("n1ql: exec returned HTTP %d: %s", resp.StatusCode, body)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("n1ql: reading exec response: %w", err)
+	}
+
+	var envelope struct {
+		Errors  []n1qlError            `json:"errors"`
+		Metrics map[string]interface{} `json:"metrics"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return nil, fmt.Errorf("n1ql: parsing exec response: %w", err)
+	}
+
+	if len(envelope.Errors) > 0 {
+		return nil, fmt.Errorf("n1ql: exec error: %s", serializeErrors(envelope.Errors))
+	}
+
+	res := &n1qlResult{}
+	if mc, ok := envelope.Metrics["mutationCount"]; ok {
+		if f, ok := mc.(float64); ok {
+			res.affectedRows = int64(f)
+		}
+	}
+	return res, nil
+}
+
+// -----------------------------------------------------------------------
+// Request builders
+// -----------------------------------------------------------------------
+
+// buildRequest constructs a plain POST request with a raw query string.
+func (c *n1qlConn) buildRequest(ctx context.Context, query string, extraParams map[string]string) (*http.Request, error) {
+	c.mu.RLock()
+	api := c.queryAPI
+	c.mu.RUnlock()
+
+	form := url.Values{}
+	form.Set("statement", query)
+	c.applyQueryParams(&form)
+	for k, v := range extraParams {
+		form.Set(k, v)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, api, bytes.NewBufferString(form.Encode()))
+	if err != nil {
+		return nil, fmt.Errorf("n1ql: building request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	return req, nil
+}
+
+// buildRequestWithArgs handles placeholder substitution and positional args,
+// or accepts pre-built form values (for prepared statements).
+func (c *n1qlConn) buildRequestWithArgs(ctx context.Context, query string, args []driver.Value, prebuilt *url.Values) (*http.Request, error) {
+	c.mu.RLock()
+	api := c.queryAPI
+	c.mu.RUnlock()
+
+	var form url.Values
+
+	if prebuilt != nil {
+		form = *prebuilt
+	} else {
+		form = url.Values{}
+
+		if len(args) > 0 {
+			replaced, argCount := replacePlaceholders(query)
+			if argCount != len(args) {
+				return nil, fmt.Errorf("n1ql: argument count mismatch: query has %d placeholders, got %d args", argCount, len(args))
+			}
+			// Use server-side positional args — never do string substitution.
+			form.Set("statement", replaced)
+			argJSON, err := buildPositionalArgList(args)
 			if err != nil {
 				return nil, err
 			}
+			form.Set("args", argJSON)
 		} else {
-			if requestValues != nil {
-				request, _ = http.NewRequest("POST", queryAPI, bytes.NewBufferString(requestValues.Encode()))
-			} else {
-				request, _ = http.NewRequest("POST", queryAPI, nil)
-			}
-			request.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+			form.Set("statement", query)
 		}
 
-		resp, err := conn.client.Do(request)
-		if err != nil {
-			// if this is the last node return with error
-			if numNodes == 1 {
-				break
-			}
-			// remove the node that failed from the list of query nodes
-			//conn.lock.Lock()
-			//conn.queryAPIs = append(conn.queryAPIs[:selectedNode], conn.queryAPIs[selectedNode+1:]...)
-			//conn.lock.Unlock()
-			continue
-		} else {
-			return resp, nil
-		}
+		c.applyQueryParams(&form)
 	}
-	return nil, fmt.Errorf("N1QL: Query nodes not responding")
-}
 
-func decodeSignature(signature *json.RawMessage) interface{} {
-
-	var sign interface{}
-	var rows map[string]interface{}
-	json.Unmarshal(*signature, &sign)
-
-	switch s := sign.(type) {
-	case map[string]interface{}:
-		return s
-	case string:
-		return s
-	default:
-		fmt.Printf(" Cannot decode signature. Type of this signature is %T", s)
-		return map[string]interface{}{"*": "*"}
-	}
-	return rows
-}
-
-func (conn *n1qlConn) performQuery(query string, requestValues *url.Values) (driver.Rows, error) {
-
-	resp, err := conn.doClientRequest(query, requestValues)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, api, bytes.NewBufferString(form.Encode()))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("n1ql: building request: %w", err)
 	}
-
-	if resp.StatusCode != 200 {
-		bod, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, fmt.Errorf("%s", bod)
-	}
-
-	var resultMap map[string]*json.RawMessage
-	decoder := json.NewDecoder(resp.Body)
-
-	err = decoder.Decode(&resultMap)
-	if err != nil {
-		return nil, fmt.Errorf(" N1QL: Failed to decode result %v", err)
-	}
-
-	// fmt.Println(resultMap, len(resultMap), N1QL_PASSTHROUGH_MODE)
-	// fmt.Printf("metrics: %c\n", resultMap["metrics"])
-	// fmt.Printf("requestID: %c\n", resultMap["requestID"])
-	//fmt.Printf("results: %c\n", resultMap["results"])
-	// fmt.Printf("signature: %c\n", resultMap["signature"])
-	// fmt.Printf("status: %c\n", resultMap["status"])
-
-	var signature interface{}
-	var resultRows *json.RawMessage
-	var metrics interface{}
-	var status interface{}
-	var requestId interface{}
-	var errs interface{}
-
-	for name, results := range resultMap {
-		switch name {
-		case "errors":
-			_ = json.Unmarshal(*results, &errs)
-		case "signature":
-			if results != nil {
-				signature = decodeSignature(results)
-			} else if N1QL_PASSTHROUGH_MODE {
-				// for certain types of DML queries, the returned signature could be null
-				// however in passthrough mode we always return the metrics, status etc as
-				// rows therefore we need to ensure that there is a default signature.
-				signature = map[string]interface{}{"*": "*"}
-			}
-		case "results":
-			resultRows = results
-		case "metrics":
-			if N1QL_PASSTHROUGH_MODE {
-				_ = json.Unmarshal(*results, &metrics)
-			}
-		case "status":
-			if N1QL_PASSTHROUGH_MODE {
-				_ = json.Unmarshal(*results, &status)
-			}
-		case "requestID":
-			if N1QL_PASSTHROUGH_MODE {
-				_ = json.Unmarshal(*results, &requestId)
-			}
-		}
-	}
-
-	if N1QL_PASSTHROUGH_MODE {
-		extraVals := map[string]interface{}{"requestID": requestId,
-			"status":    status,
-			"signature": signature,
-		}
-
-		// in passthrough mode last line will always be en error line
-		errors := map[string]interface{}{"errors": errs}
-		return resultToRows(bytes.NewReader(*resultRows), resp, signature, metrics, errors, extraVals)
-	}
-
-	// we return the errors with the rows because we can have scenarios where there are valid
-	// results returned along with the error and this interface doesn't allow for both to be
-	// returned and hence this workaround.
-	return resultToRows(bytes.NewReader(*resultRows), resp, signature, nil, errs, nil)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	return req, nil
 }
 
-func prepareQuery(query string) (string, int) {
-
-	var count int
-	re := regexp.MustCompile("\\?")
-
-	f := func(s string) string {
-		count++
-		return fmt.Sprintf("$%d", count)
+// applyQueryParams appends per-connection query parameters to a form.
+func (c *n1qlConn) applyQueryParams(v *url.Values) {
+	for k, val := range c.config.QueryParams {
+		v.Set(k, val)
 	}
-	return re.ReplaceAllStringFunc(query, f), count
 }
 
-func serializeErrors(errors interface{}) string {
-
-	var errString string
-	switch errors := errors.(type) {
-	case []interface{}:
-		for _, e := range errors {
-			switch e := e.(type) {
-			case map[string]interface{}:
-				code, _ := e["code"]
-				msg, _ := e["msg"]
-
-				if code != 0 && msg != "" {
-					if errString != "" {
-						errString = fmt.Sprintf("%v Code : %v Message : %v", errString, code, msg)
-					} else {
-						errString = fmt.Sprintf("Code : %v Message : %v", code, msg)
-					}
-				}
-			}
-		}
-	}
-	if errString != "" {
-		return errString
-	}
-	return fmt.Sprintf(" Error %v %T", errors, errors)
-}
-
-func (conn *n1qlConn) Prepare(query string) (driver.Stmt, error) {
-
-	//n1qlStmt
-	var argCount int
-
-	query = "PREPARE " + query
-	query, argCount = prepareQuery(query)
-
-	resp, err := conn.doClientRequest(query, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	if resp.StatusCode != 200 {
-		bod, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, fmt.Errorf("%s", bod)
-	}
-
-	var resultMap map[string]*json.RawMessage
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("N1QL: Failed to read response body from server. Error %v", err)
-	}
-
-	if err := json.Unmarshal(body, &resultMap); err != nil {
-		return nil, fmt.Errorf("N1QL: Failed to parse response. Error %v", err)
-	}
-
-	stmt := &n1qlStmt{conn: conn, argCount: argCount}
-
-	errors, ok := resultMap["errors"]
-	if ok && errors != nil {
-		var errs []interface{}
-		_ = json.Unmarshal(*errors, &errs)
-		return nil, fmt.Errorf("N1QL: Error preparing statement %v", serializeErrors(errs))
-	}
-
-	for name, results := range resultMap {
-
-		switch name {
-
-		case "results":
-			var preparedResults []interface{}
-			if err := json.Unmarshal(*results, &preparedResults); err != nil {
-				return nil, fmt.Errorf("N1QL: Failed to unmarshal results %v", err)
-			}
-			if len(preparedResults) == 0 {
-				return nil, fmt.Errorf("N1QL: Unknown error, no prepared results returned")
-			}
-			serialized, _ := json.Marshal(preparedResults[0])
-			stmt.name = preparedResults[0].(map[string]interface{})["name"].(string)
-			stmt.prepared = string(serialized)
-
-		case "signature":
-			stmt.signature = string(*results)
-		}
-
-	}
-
-	if stmt.prepared == "" {
-		return nil, fmt.Errorf("internal error")
-	}
-	return stmt, nil
-}
-
-func (conn *n1qlConn) Close() error {
-
-	return nil
-}
-
-func (conn *n1qlConn) Begin() (driver.Tx, error) {
-
-	return nil, fmt.Errorf("not supported")
-}
-
-func (conn *n1qlConn) Query(query string, args []driver.Value) (driver.Rows, error) {
-
-	if len(args) > 0 {
-		var argCount int
-		query, argCount = prepareQuery(query)
-		if argCount != len(args) {
-			return nil, fmt.Errorf("argument count mismatch %d != %d", argCount, len(args))
-		}
-		query, _ = preparePositionalArgs(query, argCount, args)
-	}
-	return conn.performQuery(query, nil)
-}
+// -----------------------------------------------------------------------
+// Result
+// -----------------------------------------------------------------------
 
 type n1qlResult struct {
 	affectedRows int64
-	insertId     int64
 }
 
-func (res *n1qlResult) LastInsertId() (int64, error) {
-	return res.insertId, nil
+func (r *n1qlResult) LastInsertId() (int64, error) {
+	return 0, fmt.Errorf("n1ql: LastInsertId is not supported")
 }
 
-func (res *n1qlResult) RowsAffected() (int64, error) {
-	return res.affectedRows, nil
+func (r *n1qlResult) RowsAffected() (int64, error) {
+	return r.affectedRows, nil
 }
 
-func (conn *n1qlConn) performExec(query string, requestValues *url.Values) (driver.Result, error) {
+// -----------------------------------------------------------------------
+// Statement
+// -----------------------------------------------------------------------
 
-	resp, err := conn.doClientRequest(query, requestValues)
-	if err != nil {
-		return nil, err
-	}
-
-	if resp.StatusCode != 200 {
-		bod, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, fmt.Errorf("%s", bod)
-	}
-
-	var resultMap map[string]*json.RawMessage
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("N1QL: Failed to read response body from server. Error %v", err)
-	}
-
-	if err := json.Unmarshal(body, &resultMap); err != nil {
-		return nil, fmt.Errorf("N1QL: Failed to parse response. Error %v", err)
-	}
-
-	//fmt.Printf("metrics:%c %T\n", resultMap["metrics"], resultMap["metrics"])
-	var execErr error
-	res := &n1qlResult{}
-	for name, results := range resultMap {
-		switch name {
-		case "metrics":
-			var metrics map[string]interface{}
-			err := json.Unmarshal(*results, &metrics)
-			if err != nil {
-				return nil, fmt.Errorf("N1QL: Failed to unmarshal response. Error %v", err)
-			}
-			if mc, ok := metrics["mutationCount"]; ok {
-				res.affectedRows = int64(mc.(float64))
-			}
-			break
-
-		case "errors":
-			var errs []interface{}
-			_ = json.Unmarshal(*results, &errs)
-			execErr = fmt.Errorf("N1QL: Error executing query %v", serializeErrors(errs))
-		}
-	}
-
-	return res, execErr
-}
-
-// Replace the conditional pqrams in the query and return the list of left-over args
-func preparePositionalArgs(query string, argCount int, args []driver.Value) (string, []driver.Value) {
-
-	subList := make([]string, 0)
-	newArgs := make([]driver.Value, 0)
-
-	for i, arg := range args {
-		if i < argCount {
-			var a string
-			switch arg := arg.(type) {
-			case string:
-				a = fmt.Sprintf("\"%v\"", arg)
-				//a = fmt.Sprintf("%q", arg)
-			case []byte:
-				a = string(arg)
-			default:
-				a = fmt.Sprintf("%v", arg)
-			}
-			sub := []string{fmt.Sprintf("$%d", i+1), a}
-			subList = append(subList, sub...)
-		} else {
-			newArgs = append(newArgs, arg)
-		}
-	}
-	r := strings.NewReplacer(subList...)
-	return r.Replace(query), newArgs
-}
-
-func (conn *n1qlConn) Exec(query string, args []driver.Value) (driver.Result, error) {
-
-	if len(args) > 0 {
-		var argCount int
-		query, argCount = prepareQuery(query)
-		if argCount != len(args) {
-			return nil, fmt.Errorf("argument count mismatch %d != %d", argCount, len(args))
-		}
-		query, _ = preparePositionalArgs(query, argCount, args)
-	}
-	return conn.performExec(query, nil)
-}
-
-// implements driver.Stmt interface
+// n1qlStmt implements driver.Stmt and driver.StmtQueryContext.
 type n1qlStmt struct {
-	conn      *n1qlConn
-	prepared  string
-	signature string
-	argCount  int
-	name      string
+	conn     *n1qlConn
+	prepared string
+	name     string
+	argCount int
+	mu       sync.Mutex
+	closed   bool
 }
 
-func (stmt *n1qlStmt) Close() error {
-
-	stmt.prepared = ""
-	stmt.signature = ""
-	stmt.argCount = 0
-	stmt = nil
+func (s *n1qlStmt) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closed = true
+	s.prepared = ""
+	s.name = ""
 	return nil
 }
 
-func (stmt *n1qlStmt) NumInput() int {
-	return stmt.argCount
+func (s *n1qlStmt) NumInput() int { return s.argCount }
+
+func (s *n1qlStmt) Exec(args []driver.Value) (driver.Result, error) {
+	return s.ExecContext(context.Background(), toNamedValues(args))
 }
 
-func buildPositionalArgList(args []driver.Value) string {
-	positionalArgs := make([]string, 0)
-	for _, arg := range args {
-		switch arg := arg.(type) {
-		case string:
-			// add double quotes since this is a string
-			positionalArgs = append(positionalArgs, fmt.Sprintf("\"%v\"", arg))
-		case []byte:
-			positionalArgs = append(positionalArgs, string(arg))
-		default:
-			positionalArgs = append(positionalArgs, fmt.Sprintf("%v", arg))
-		}
-	}
-
-	if len(positionalArgs) > 0 {
-		paStr := "["
-		for i, param := range positionalArgs {
-			if i == len(positionalArgs)-1 {
-				paStr = fmt.Sprintf("%s%s]", paStr, param)
-			} else {
-				paStr = fmt.Sprintf("%s%s,", paStr, param)
-			}
-		}
-		return paStr
-	}
-	return ""
+func (s *n1qlStmt) Query(args []driver.Value) (driver.Rows, error) {
+	return s.QueryContext(context.Background(), toNamedValues(args))
 }
 
-// prepare a http request for the query
-func (stmt *n1qlStmt) prepareRequest(args []driver.Value) (*url.Values, error) {
-
-	postData := url.Values{}
-
-	// use name prepared statement if possible
-	if stmt.name != "" {
-		postData.Set("prepared", fmt.Sprintf("\"%s\"", stmt.name))
-	} else {
-		postData.Set("prepared", stmt.prepared)
+// ExecContext implements driver.StmtExecContext.
+func (s *n1qlStmt) ExecContext(ctx context.Context, args []driver.NamedValue) (driver.Result, error) {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("n1ql: statement is closed")
 	}
+	s.mu.Unlock()
 
-	if len(args) < stmt.NumInput() {
-		return nil, fmt.Errorf("N1QL: Insufficient args. Prepared statement contains positional args")
-	}
-
-	if len(args) > 0 {
-		paStr := buildPositionalArgList(args)
-		if len(paStr) > 0 {
-			postData.Set("args", paStr)
-		}
-	}
-	setQueryParams(&postData)
-	return &postData, nil
-}
-
-func (stmt *n1qlStmt) Exec(args []driver.Value) (driver.Result, error) {
-
-	if stmt.prepared == "" {
-		return nil, fmt.Errorf("N1QL: Prepared statement not found")
-	}
-	requestValues, err := stmt.prepareRequest(args)
+	form, err := s.buildForm(args)
 	if err != nil {
 		return nil, err
 	}
-	return stmt.conn.performExec("", requestValues)
-}
-
-func (stmt *n1qlStmt) Query(args []driver.Value) (driver.Rows, error) {
-
-	fmt.Println("stmtQuery", args, len(args))
-	if stmt.prepared == "" {
-		return nil, fmt.Errorf("N1QL: Prepared statement not found")
-	}
-
-retry:
-	requestValues, err := stmt.prepareRequest(args)
+	req, err := s.conn.buildRequestWithArgs(ctx, "", nil, form)
 	if err != nil {
 		return nil, err
 	}
-	rows, err := stmt.conn.performQuery("", requestValues)
-	if err != nil && stmt.name != "" {
-		// retry once if we used a named prepared statement
-		stmt.name = ""
-		goto retry
+	return s.conn.doExec(req)
+}
+
+// QueryContext implements driver.StmtQueryContext.
+func (s *n1qlStmt) QueryContext(ctx context.Context, args []driver.NamedValue) (driver.Rows, error) {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("n1ql: statement is closed")
+	}
+	name := s.name
+	s.mu.Unlock()
+
+	form, err := s.buildForm(args)
+	if err != nil {
+		return nil, err
+	}
+	req, err := s.conn.buildRequestWithArgs(ctx, "", nil, form)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := s.conn.doQuery(req)
+	if err != nil && name != "" {
+		// Named prepared statement may have been evicted from the server cache.
+		// Retry once using the full prepared JSON instead.
+		s.mu.Lock()
+		s.name = ""
+		s.mu.Unlock()
+
+		form2, _ := s.buildForm(args)
+		req2, rerr := s.conn.buildRequestWithArgs(ctx, "", nil, form2)
+		if rerr != nil {
+			return nil, rerr
+		}
+		return s.conn.doQuery(req2)
 	}
 	return rows, err
+}
+
+// buildForm constructs the POST form for a prepared statement execution.
+func (s *n1qlStmt) buildForm(args []driver.NamedValue) (*url.Values, error) {
+	vals, err := namedValuesToValues(args)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(vals) < s.argCount {
+		return nil, fmt.Errorf("n1ql: insufficient args: need %d, got %d", s.argCount, len(vals))
+	}
+
+	form := url.Values{}
+
+	s.mu.Lock()
+	name := s.name
+	prepared := s.prepared
+	s.mu.Unlock()
+
+	if name != "" {
+		form.Set("prepared", fmt.Sprintf("%q", name))
+	} else {
+		form.Set("prepared", prepared)
+	}
+
+	if len(vals) > 0 {
+		argJSON, err := buildPositionalArgList(vals)
+		if err != nil {
+			return nil, err
+		}
+		form.Set("args", argJSON)
+	}
+
+	s.conn.applyQueryParams(&form)
+	return &form, nil
+}
+
+// -----------------------------------------------------------------------
+// Error type
+// -----------------------------------------------------------------------
+
+type n1qlError struct {
+	Code int    `json:"code"`
+	Msg  string `json:"msg"`
+}
+
+func (e n1qlError) Error() string {
+	return fmt.Sprintf("code=%d msg=%s", e.Code, e.Msg)
+}
+
+func serializeErrors(errs []n1qlError) string {
+	if len(errs) == 0 {
+		return "unknown error"
+	}
+	b := &bytes.Buffer{}
+	for i, e := range errs {
+		if i > 0 {
+			b.WriteString("; ")
+		}
+		fmt.Fprintf(b, "code=%d msg=%s", e.Code, e.Msg)
+	}
+	return b.String()
+}
+
+// -----------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------
+
+// replacePlaceholders converts bare ? markers to $1, $2, … and returns
+// the rewritten query and the number of placeholders found.
+func replacePlaceholders(query string) (string, int) {
+	count := 0
+	replaced := placeholderRe.ReplaceAllStringFunc(query, func(string) string {
+		count++
+		return fmt.Sprintf("$%d", count)
+	})
+	return replaced, count
+}
+
+// buildPositionalArgList serialises driver.Value args to a JSON array string
+// suitable for the N1QL "args" parameter.
+// Using JSON marshalling ensures correct escaping — no string substitution.
+func buildPositionalArgList(args []driver.Value) (string, error) {
+	out := make([]interface{}, len(args))
+	for i, arg := range args {
+		switch v := arg.(type) {
+		case []byte:
+			// Treat raw bytes as a pre-encoded JSON value.
+			out[i] = json.RawMessage(v)
+		default:
+			out[i] = v
+		}
+	}
+	b, err := json.Marshal(out)
+	if err != nil {
+		return "", fmt.Errorf("n1ql: marshalling args: %w", err)
+	}
+	return string(b), nil
+}
+
+// namedValuesToValues strips the Name/Ordinal wrapper from NamedValues.
+func namedValuesToValues(named []driver.NamedValue) ([]driver.Value, error) {
+	out := make([]driver.Value, len(named))
+	for i, nv := range named {
+		if nv.Name != "" {
+			return nil, fmt.Errorf("n1ql: named parameters are not supported (got %q)", nv.Name)
+		}
+		out[i] = nv.Value
+	}
+	return out, nil
+}
+
+// toNamedValues wraps plain Values for use with the Context variants.
+func toNamedValues(vals []driver.Value) []driver.NamedValue {
+	out := make([]driver.NamedValue, len(vals))
+	for i, v := range vals {
+		out[i] = driver.NamedValue{Ordinal: i + 1, Value: v}
+	}
+	return out
 }
